@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2018 the original author or authors.
+ * Copyright 2013-2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
 package org.springframework.cloud.netflix.turbine.stream;
@@ -24,19 +23,23 @@ import java.io.InputStreamReader;
 import java.net.URI;
 import java.util.Map;
 
-import org.junit.Ignore;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+
+import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.beans.factory.support.BeanDefinitionRegistry;
+import org.springframework.beans.factory.support.BeanDefinitionRegistryPostProcessor;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.web.server.LocalServerPort;
 import org.springframework.cloud.contract.stubrunner.StubTrigger;
 import org.springframework.cloud.contract.stubrunner.spring.AutoConfigureStubRunner;
-import org.springframework.cloud.contract.verifier.messaging.MessageVerifier;
-import org.springframework.cloud.contract.verifier.messaging.stream.StreamStubMessages;
-import org.springframework.context.ApplicationContext;
+import org.springframework.cloud.contract.stubrunner.spring.StubRunnerProperties.StubsMode;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -48,11 +51,9 @@ import org.springframework.http.client.ClientHttpRequestExecution;
 import org.springframework.http.client.ClientHttpRequestInterceptor;
 import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.integration.support.management.MessageChannelMetrics;
-import org.springframework.messaging.Message;
 import org.springframework.messaging.SubscribableChannel;
 import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
 import org.springframework.web.client.RestTemplate;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.boot.test.context.SpringBootTest.WebEnvironment.RANDOM_PORT;
@@ -67,10 +68,10 @@ import static org.springframework.boot.test.context.SpringBootTest.WebEnvironmen
 		// https://github.com/spring-cloud/spring-cloud-netflix/issues/1948
 		"spring.cloud.stream.bindings.turbineStreamInput.destination=hystrixStreamOutput",
 		"spring.jmx.enabled=true", "stubrunner.workOffline=true",
-		"stubrunner.ids=org.springframework.cloud:spring-cloud-netflix-hystrix-stream:${projectVersion:2.0.0.BUILD-SNAPSHOT}:stubs",
-		})
-@AutoConfigureStubRunner
+		"stubrunner.ids=org.springframework.cloud:spring-cloud-netflix-hystrix-stream:${projectVersion:2.0.0.BUILD-SNAPSHOT}:stubs" })
+@AutoConfigureStubRunner(stubsMode = StubsMode.LOCAL)
 public class TurbineStreamTests {
+
 	@Autowired
 	StubTrigger stubTrigger;
 
@@ -89,43 +90,21 @@ public class TurbineStreamTests {
 	@LocalServerPort
 	int port;
 
-	@EnableAutoConfiguration
-	@EnableTurbineStream
-	public static class Application {
-		@Bean
-		//TODO This can be removed after Finchley.RELEASE, once we can use Spring Cloud Contract Verifier 2.0.0
-		//This is a hack to allow compatibility between Stream 2.0.0, which is sending everything as a byte array,
-		//and contract which is assuming everything is a String.
-		public MessageVerifier<Message<?>> customMessageVerifier(ApplicationContext context) {
-			return new StreamStubMessages(context) {
-				@Override
-				public <T> void send(T payload, Map<String, Object> headers, String destination) {
-					if(String.class.isInstance(payload)){
-						super.send(((String)payload).getBytes(), headers, destination);
-						return;
-					}
-					super.send(payload, headers, destination);
-				}
-			};
-		}
-	}
-
 	@Test
-	@Ignore //FIXME: 2.1.0
 	public void contextLoads() throws Exception {
 		rest.getInterceptors().add(new NonClosingInterceptor());
 		int count = ((MessageChannelMetrics) input).getSendCount();
 		ResponseEntity<String> response = rest.execute(
-				new URI("http://localhost:" + port + "/"),
-				HttpMethod.GET, null, this::extract);
-		assertThat(response.getHeaders().getContentType().isCompatibleWith(MediaType.TEXT_EVENT_STREAM))
-				.isTrue();
+				new URI("http://localhost:" + port + "/"), HttpMethod.GET, null,
+				this::extract);
+		assertThat(response.getHeaders().getContentType()
+				.isCompatibleWith(MediaType.TEXT_EVENT_STREAM)).isTrue();
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 		Map<String, Object> metrics = extractMetrics(response.getBody());
 		assertThat(metrics).containsEntry("type", "HystrixCommand");
 		assertThat(((MessageChannelMetrics) input).getSendCount()).isEqualTo(count + 1);
 	}
-	
+
 	private boolean containsMetrics(String line) {
 		return line.startsWith("data:") && !line.contains("Ping");
 	}
@@ -164,17 +143,50 @@ public class TurbineStreamTests {
 				.headers(response.getHeaders()).body(responseBody);
 	}
 
+	@EnableAutoConfiguration
+	@EnableTurbineStream
+	public static class Application {
+
+		// Workaround for stub runner lowercasing id somewhere
+		@Bean
+		BeanDefinitionRegistryPostProcessor myBeanDefinitionRegistryPostProcessor() {
+			return new BeanDefinitionRegistryPostProcessor() {
+				@Override
+				public void postProcessBeanDefinitionRegistry(
+						BeanDefinitionRegistry registry) throws BeansException {
+					BeanDefinition beanDefinition = registry
+							.getBeanDefinition(TurbineStreamClient.INPUT);
+					registry.registerBeanDefinition(
+							TurbineStreamClient.INPUT.toLowerCase(), beanDefinition);
+				}
+
+				@Override
+				public void postProcessBeanFactory(
+						ConfigurableListableBeanFactory beanFactory)
+						throws BeansException {
+				}
+			};
+		}
+
+	}
+
 	/**
 	 * Special interceptor that prevents the response from being closed and allows us to
 	 * assert on the contents of an event stream.
 	 */
 	private class NonClosingInterceptor implements ClientHttpRequestInterceptor {
 
+		@Override
+		public ClientHttpResponse intercept(HttpRequest request, byte[] body,
+				ClientHttpRequestExecution execution) throws IOException {
+			return new NonClosingResponse(execution.execute(request, body));
+		}
+
 		private class NonClosingResponse implements ClientHttpResponse {
 
 			private ClientHttpResponse delegate;
 
-			public NonClosingResponse(ClientHttpResponse delegate) {
+			NonClosingResponse(ClientHttpResponse delegate) {
 				this.delegate = delegate;
 			}
 
@@ -209,11 +221,6 @@ public class TurbineStreamTests {
 
 		}
 
-		@Override
-		public ClientHttpResponse intercept(HttpRequest request, byte[] body,
-				ClientHttpRequestExecution execution) throws IOException {
-			return new NonClosingResponse(execution.execute(request, body));
-		}
-
 	}
+
 }
